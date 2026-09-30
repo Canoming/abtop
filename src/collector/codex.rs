@@ -205,7 +205,6 @@ impl CodexCollector {
                 }
             }
             Self::sort_rollouts_by_mtime_desc(&mut desktop_rollout_paths);
-
             for path in desktop_rollout_paths {
                 let pid = desktop_pid_for_path.get(&path).copied();
                 let process_ctx = CodexProcessContext {
@@ -911,7 +910,12 @@ struct CodexJSONLResult {
 
 impl CodexJSONLResult {
     fn is_codex_desktop(&self) -> bool {
-        self.originator == "Codex Desktop"
+        // The Desktop discovery path also handles CLI sessions (including
+        // those launched in herdr) whose rollouts are held by an app-server.
+        matches!(
+            self.originator.as_str(),
+            "Codex Desktop" | "codex_work_desktop" | "codex_vscode" | "codex-tui"
+        )
     }
 }
 
@@ -1303,6 +1307,10 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
         match val["type"].as_str() {
             Some("session_meta") => {
                 let payload = &val["payload"];
+                // Guardian rollouts are internal approval reviews, not user sessions.
+                if payload["source"]["subagent"]["other"].as_str() == Some("guardian") {
+                    return None;
+                }
                 if let Some(id) = payload["id"].as_str() {
                     result.session_id = id.to_string();
                 }
@@ -1649,6 +1657,7 @@ mod tests {
 
     const SESSION_META: &str = r#"{"type":"session_meta","timestamp":"2026-03-28T15:00:00Z","payload":{"id":"sess-123","cwd":"/home/user/project","cli_version":"0.1.5","timestamp":"2026-03-28T15:00:00Z","git":{"branch":"feature/x"}}}"#;
     const DESKTOP_SESSION_META: &str = r#"{"type":"session_meta","timestamp":"2026-03-28T15:00:00Z","payload":{"id":"desktop-123","cwd":"/home/user/project","originator":"Codex Desktop","cli_version":"0.131.0-alpha.9","timestamp":"2026-03-28T15:00:00Z","git":{"branch":"feature/x"}}}"#;
+    const DAEMON_CLI_SESSION_META: &str = r#"{"type":"session_meta","timestamp":"2026-09-30T09:59:14Z","payload":{"id":"cli-123","cwd":"/home/user/project","originator":"codex-tui","source":"vscode","cli_version":"0.159.2","timestamp":"2026-09-30T09:59:14Z"}}"#;
 
     fn write_lines(file: &mut tempfile::NamedTempFile, lines: &[&str]) {
         for line in lines {
@@ -1804,19 +1813,52 @@ mod tests {
 
     #[test]
     fn desktop_rollout_filter_requires_originator() {
-        let mut desktop = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut desktop, &[DESKTOP_SESSION_META]);
+        for originator in [
+            "Codex Desktop",
+            "codex_work_desktop",
+            "codex_vscode",
+            "codex-tui",
+        ] {
+            let mut desktop = tempfile::NamedTempFile::new().unwrap();
+            let metadata = DESKTOP_SESSION_META.replace("Codex Desktop", originator);
+            write_lines(&mut desktop, &[&metadata]);
+            assert!(CodexCollector::is_active_desktop_rollout(
+                desktop.path(),
+                super::super::mcp::ACTIVE_MTIME_SECS
+            ));
+        }
         let mut cli = tempfile::NamedTempFile::new().unwrap();
         write_lines(&mut cli, &[SESSION_META]);
-
-        assert!(CodexCollector::is_active_desktop_rollout(
-            desktop.path(),
-            super::super::mcp::ACTIVE_MTIME_SECS
-        ));
         assert!(!CodexCollector::is_active_desktop_rollout(
             cli.path(),
             super::super::mcp::ACTIVE_MTIME_SECS
         ));
+        let mut unsupported = tempfile::NamedTempFile::new().unwrap();
+        let metadata = DESKTOP_SESSION_META.replace("Codex Desktop", "unsupported-client");
+        write_lines(&mut unsupported, &[&metadata]);
+        assert!(!CodexCollector::is_active_desktop_rollout(
+            unsupported.path(),
+            super::super::mcp::ACTIVE_MTIME_SECS
+        ));
+    }
+
+    #[test]
+    fn guardian_rollouts_are_not_sessions() {
+        let mut metadata: Value = serde_json::from_str(DESKTOP_SESSION_META).unwrap();
+        metadata["payload"]["source"] = serde_json::json!({"subagent": {"other": "guardian"}});
+        let mut guardian = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut guardian, &[&metadata.to_string()]);
+
+        assert!(parse_codex_jsonl(guardian.path()).is_none());
+        assert!(!CodexCollector::is_active_desktop_rollout(
+            guardian.path(),
+            super::super::mcp::ACTIVE_MTIME_SECS
+        ));
+
+        metadata["payload"]["source"] = serde_json::json!({"subagent": {"other": "explore"}});
+        let mut other_subagent = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut other_subagent, &[&metadata.to_string()]);
+        assert!(parse_codex_jsonl(other_subagent.path()).is_some());
     }
 
     #[test]
@@ -1999,6 +2041,124 @@ mod tests {
         assert_eq!(sessions[0].session_id, "desktop-123");
         assert_eq!(sessions[0].status, SessionStatus::Unknown);
         assert_eq!(sessions[0].current_tasks, vec!["unknown".to_string()]);
+    }
+
+    #[test]
+    fn daemon_cli_rollout_resolves_host_without_duplicate_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let today = root
+            .path()
+            .join(chrono::Local::now().format("%Y/%m/%d").to_string());
+        fs::create_dir_all(&today).unwrap();
+        let path = today.join("rollout-cli.jsonl");
+        write_jsonl(
+            &path,
+            &[
+                DAEMON_CLI_SESSION_META,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"output_tokens":200,"cached_input_tokens":100},"last_token_usage":{"input_tokens":50,"output_tokens":20,"cached_input_tokens":10},"model_context_window":128000}}}"#,
+                r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+            ],
+        );
+        let mut collector = CodexCollector {
+            sessions_dir: root.path().to_path_buf(),
+            last_rate_limit: None,
+            desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
+        };
+        let mut shared = super::super::SharedProcessData {
+            process_info: HashMap::from([
+                (99, proc_info(99, 1, "codex app-server --listen stdio://")),
+                (100, proc_info(100, 99, "cargo test")),
+            ]),
+            children_map: HashMap::from([(99, vec![100])]),
+            ports: HashMap::from([(100, vec![3000])]),
+            slow_tick: false,
+            mcp_server_pids: HashSet::new(),
+            mcp_owned_rollouts: HashSet::new(),
+            mcp_suppress: true,
+            desktop_rollout_fd_map: HashMap::new(),
+        };
+
+        let sessions = collector.collect_sessions(&shared);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "cli-123");
+        assert_eq!(sessions[0].pid, 0);
+        assert_eq!(sessions[0].status, SessionStatus::Unknown);
+
+        shared
+            .desktop_rollout_fd_map
+            .insert(99, vec![path.clone(), path]);
+        let sessions = collector.collect_sessions(&shared);
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.session_id, "cli-123");
+        assert_eq!(session.pid, 99);
+        assert_eq!(session.agent_cli, "codex");
+        assert_eq!(session.status, SessionStatus::Waiting);
+        assert_eq!(session.total_input_tokens, 400);
+        assert_eq!(session.total_output_tokens, 200);
+        assert_eq!(session.total_cache_read, 100);
+        assert_eq!(session.mem_mb, 0);
+        assert!(session.children.is_empty());
+    }
+
+    #[test]
+    fn daemon_cli_rollouts_preserve_exclusions_and_inactivity_cutoff() {
+        let root = tempfile::tempdir().unwrap();
+        let active = root.path().join("rollout-active.jsonl");
+        let stale = root.path().join("rollout-stale.jsonl");
+        let seen = root.path().join("rollout-seen.jsonl");
+        let mcp = root.path().join("rollout-mcp.jsonl");
+        let guardian = root.path().join("rollout-guardian.jsonl");
+        for path in [&active, &stale, &seen, &mcp] {
+            write_jsonl(path, &[DAEMON_CLI_SESSION_META]);
+        }
+        let mut metadata: Value = serde_json::from_str(DAEMON_CLI_SESSION_META).unwrap();
+        metadata["payload"]["source"] = serde_json::json!({"subagent": {"other": "guardian"}});
+        write_jsonl(&guardian, &[&metadata.to_string()]);
+        let cutoff = super::super::mcp::ACTIVE_MTIME_SECS;
+        set_modified(&stale, SystemTime::now() - Duration::from_secs(cutoff));
+        let seen_jsonl = HashSet::from([seen.clone()]);
+        let mcp_owned = HashSet::from([mcp.clone()]);
+        let by_pid = HashMap::from([(
+            99,
+            vec![
+                active.clone(),
+                active.clone(),
+                stale.clone(),
+                seen,
+                mcp,
+                guardian,
+            ],
+        )]);
+
+        assert_eq!(
+            CodexCollector::active_desktop_rollouts(
+                by_pid.clone(),
+                &seen_jsonl,
+                &mcp_owned,
+                cutoff,
+            ),
+            vec![(99, active.clone())]
+        );
+        assert_eq!(
+            CodexCollector::recent_desktop_rollouts(root.path(), &seen_jsonl, &mcp_owned, cutoff,),
+            vec![active]
+        );
+
+        set_modified(&stale, SystemTime::now() - Duration::from_secs(cutoff + 60));
+        assert!(!CodexCollector::is_active_desktop_rollout(&stale, cutoff));
+        set_modified(&stale, SystemTime::now());
+        assert!(
+            CodexCollector::active_desktop_rollouts(by_pid, &seen_jsonl, &mcp_owned, cutoff,)
+                .contains(&(99, stale.clone()))
+        );
+        assert!(CodexCollector::recent_desktop_rollouts(
+            root.path(),
+            &seen_jsonl,
+            &mcp_owned,
+            cutoff,
+        )
+        .contains(&stale));
     }
 
     #[test]

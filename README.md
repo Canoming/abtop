@@ -65,6 +65,8 @@ Mouse capture is off by default so terminal drag selection and copy keep working
 
 Press `Enter` to focus the terminal running the selected agent. abtop supports cmux, tmux, and iTerm2 on macOS.
 
+For Codex sessions in Herdr, abtop first tries `herdr agent list` and focuses the matching pane. It prefers an exact session ID; when Herdr does not expose one, the working directory must contain exactly one Herdr Codex pane and one unfinished abtop Codex session. Ambiguous matches and focus failures appear in the status line. Herdr commands run only on Enter, with a two-second timeout each. Pane selection does not raise Herdr's outer terminal window.
+
 ```bash
 tmux new -s work
 # pane 0: abtop

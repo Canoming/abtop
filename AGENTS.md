@@ -274,7 +274,7 @@ Tracks child processes that have open ports. When a parent session dies but the 
 | Key | Action |
 |-----|--------|
 | `↑`/`↓` or `k`/`j` | Select session in list |
-| `Enter` | Jump to session terminal (cmux / tmux / iTerm2) |
+| `Enter` | Jump to session pane (Herdr Codex / cmux / tmux / iTerm2) |
 | `x` | Kill selected session (SIGKILL) |
 | `X` | Kill all orphan ports |
 | `q` | Quit |
@@ -353,7 +353,16 @@ cargo clippy                   # Lint
 
 ## Terminal Jump (`Enter`)
 
-`Enter` focuses the terminal running the selected session's agent process.
+`Enter` first tries Herdr pane routing for unfinished Codex sessions, then
+focuses the terminal running the selected session's agent process.
+`jump/herdr.rs` queries `herdr agent list` only on Enter and prefers an exact
+`agent_session` identity. Without identity, canonical cwd matching requires
+one Codex pane and one unfinished abtop Codex session in that directory.
+Ambiguity and focus failures surface as `herdr: <msg>` in the status line.
+Each Herdr command has a two-second timeout. Missing/unavailable Herdr or no
+matching pane falls through to PID routing; PID `0` never reaches PID adapters.
+Herdr selects only its pane, without raising the outer terminal window.
+
 The logic lives in `src/jump/` as a registry of `TerminalJumper` adapters
 (one file per backend). `jumpers()` is the single ordered source of truth;
 `resolve()` walks it and the first applicable adapter wins.

@@ -11,11 +11,13 @@
 //! process. Only `Failed`/`Jumped` stop the walk.
 
 mod cmux;
+mod herdr;
 #[cfg(target_os = "macos")]
 mod iterm2;
 mod tmux;
 
 use crate::app::JumpOutcome;
+use crate::model::{AgentSession, SessionStatus};
 use std::collections::HashMap;
 use std::process::Command;
 
@@ -41,6 +43,10 @@ pub trait TerminalJumper {
 /// Walk the adapters in order; the first non-`NotApplicable` result decides.
 /// All `NotApplicable` → `NoOp` (nothing happened, no error to report).
 pub fn resolve(jumpers: &[Box<dyn TerminalJumper>], pid: u32) -> JumpOutcome {
+    // Unknown process ownership must never reach process-based adapters.
+    if pid == 0 {
+        return JumpOutcome::NoOp;
+    }
     for j in jumpers {
         match j.try_jump(pid) {
             JumpAttempt::NotApplicable => continue,
@@ -74,9 +80,32 @@ pub fn jumpers() -> Vec<Box<dyn TerminalJumper>> {
     vec![Box::new(cmux::CmuxJumper), Box::new(tmux::TmuxJumper)]
 }
 
-/// Entry point used by the app: run the selected PID through the registry.
-pub fn run_jump(pid: u32) -> JumpOutcome {
-    resolve(&jumpers(), pid)
+/// Entry point used by the app: try Herdr session routing before PID routing.
+/// Discovery happens only when the user requests a jump, never during polling.
+pub fn run_jump(session: &AgentSession, sessions: &[AgentSession]) -> JumpOutcome {
+    let attempt = if session.agent_cli == "codex" && session.status != SessionStatus::Done {
+        let unfinished_cwds: Vec<&str> = sessions
+            .iter()
+            .filter(|s| s.agent_cli == "codex" && s.status != SessionStatus::Done)
+            .map(|s| s.cwd.as_str())
+            .collect();
+        herdr::try_jump(&session.session_id, &session.cwd, &unfinished_cwds)
+    } else {
+        JumpAttempt::NotApplicable
+    };
+    resolve_session_jump(attempt, &jumpers(), session.pid)
+}
+
+fn resolve_session_jump(
+    herdr_attempt: JumpAttempt,
+    jumpers: &[Box<dyn TerminalJumper>],
+    pid: u32,
+) -> JumpOutcome {
+    match herdr_attempt {
+        JumpAttempt::Jumped => JumpOutcome::Jumped,
+        JumpAttempt::Failed(msg) => JumpOutcome::Failed(format!("herdr: {msg}")),
+        JumpAttempt::NotApplicable => resolve(jumpers, pid),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +247,62 @@ mod tests {
     }
 
     // ---- resolve / registry loop ----
+
+    struct MustNotRun;
+
+    impl TerminalJumper for MustNotRun {
+        fn name(&self) -> &'static str {
+            "must-not-run"
+        }
+
+        fn try_jump(&self, _pid: u32) -> JumpAttempt {
+            panic!("process adapter must not run")
+        }
+    }
+
+    #[test]
+    fn pid_zero_never_reaches_process_adapters() {
+        assert_eq!(resolve(&[Box::new(MustNotRun)], 0), JumpOutcome::NoOp);
+    }
+
+    #[test]
+    fn herdr_jump_precedes_process_adapters_even_with_pid_zero() {
+        for pid in [0, 123] {
+            assert_eq!(
+                resolve_session_jump(JumpAttempt::Jumped, &[Box::new(MustNotRun)], pid),
+                JumpOutcome::Jumped
+            );
+        }
+    }
+
+    #[test]
+    fn herdr_failure_stops_routing_and_prefixes_status() {
+        assert_eq!(
+            resolve_session_jump(
+                JumpAttempt::Failed("ambiguous panes".into()),
+                &[Box::new(MustNotRun)],
+                123,
+            ),
+            JumpOutcome::Failed("herdr: ambiguous panes".into()),
+        );
+    }
+
+    #[test]
+    fn no_herdr_match_preserves_terminal_routing() {
+        let js = vec![
+            boxed(Mock("cmux", JumpAttempt::NotApplicable)),
+            boxed(Mock("tmux", JumpAttempt::Jumped)),
+            Box::new(MustNotRun) as Box<dyn TerminalJumper>,
+        ];
+        assert_eq!(
+            resolve_session_jump(JumpAttempt::NotApplicable, &js, 123),
+            JumpOutcome::Jumped,
+        );
+        assert_eq!(
+            resolve_session_jump(JumpAttempt::NotApplicable, &[Box::new(MustNotRun)], 0),
+            JumpOutcome::NoOp,
+        );
+    }
 
     #[test]
     fn resolve_all_not_applicable_is_noop() {

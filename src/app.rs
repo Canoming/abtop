@@ -791,15 +791,14 @@ impl App {
     }
 
     /// Jump to the terminal running the selected session's agent process.
-    /// Delegates to the terminal-jumper registry (cmux / tmux / iTerm2);
+    /// Tries Herdr session routing, then the terminal registry (cmux / tmux / iTerm2);
     /// see [`crate::jump`]. No-op when nothing is selected or no backend
     /// recognizes the process.
     pub fn jump_to_session(&mut self) -> JumpOutcome {
-        if self.sessions.is_empty() {
+        let Some(session) = self.sessions.get(self.selected) else {
             return JumpOutcome::NoOp;
-        }
-        let target_pid = self.sessions[self.selected].pid;
-        crate::jump::run_jump(target_pid)
+        };
+        crate::jump::run_jump(session, &self.sessions)
     }
 
     /// Get the display summary for a session: LLM summary > "..." if pending > raw prompt > "—"
