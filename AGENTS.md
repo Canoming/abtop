@@ -2,107 +2,136 @@
 
 AI agent monitor for your terminal. Like btop++, but for AI coding agents.
 
-Supports Claude Code, Codex CLI, and OpenCode sessions.
-
-## Language Policy
-
-English is mandatory for all project-facing work and communication.
-
-- Write all source code, comments, tests, fixtures, documentation, examples, configuration text, scripts, and user-facing strings in English.
-- Use English for every GitHub artifact: issue titles and bodies, issue comments, pull request titles and descriptions, review comments, commit messages, branch names, release notes, changelogs, discussions, labels, milestones, and workflow or CI messages.
-- Do not use non-English text in repository content or GitHub communication unless it is an exact external identifier, a required protocol value, or a direct quote needed for context.
-- When quoting or preserving non-English input, add an English explanation and keep the non-English text as short as possible.
-- If a contributor opens an issue, comment, or review in another language, respond in English and continue the thread in English.
+Supports Claude Code (CLI, desktop app, and IDE extension processes), Codex CLI and desktop app-server sessions, and OpenCode sessions.
 
 ## Architecture
 
 ```
 src/
-├── main.rs                 # Entry, terminal setup, event loop, --setup flag
-├── app.rs                  # App state, tick logic, key handling, summary generation
+├── main.rs                 # Thin binary entry: abtop::run()
+├── lib.rs                  # Public modules, CLI modes, terminal/event loop, input handling
+├── app.rs                  # App state, collection ticks, UI actions, summary jobs/cache
+├── config.rs               # Config parsing/persistence, panel visibility, profile roots
+├── theme.rs                # Built-in color palettes and gradients
+├── locale.rs               # English/Simplified Chinese UI strings
+├── host_info.rs            # Host CPU/memory/load sampling and agent aggregates
+├── snapshot.rs             # Serializable Snapshot DTOs and App::to_snapshot()
+├── demo.rs                 # Demo data for --demo
 ├── setup.rs                # StatusLine hook installation (abtop --setup)
 ├── ui/
-│   └── mod.rs              # All panels in single file: header, context, quota,
-│                           # tokens, projects, ports, sessions, footer
+│   ├── mod.rs              # Responsive layout, shared drawing helpers, click targets
+│   ├── context.rs          # Token-rate graph and per-session context meters
+│   ├── quota.rs            # Claude/Codex remaining quota and reset countdowns
+│   ├── tokens.rs           # Selected session token breakdown and history
+│   ├── projects.rs         # Project branches and Git file counts
+│   ├── ports.rs            # Session ports, conflicts, orphan ports
+│   ├── sessions.rs         # Session table/tree, chat detail, timeline, file audit
+│   ├── mcp.rs              # Codex MCP-server processes and rollout activity
+│   ├── header.rs           # Version, clock, host/agent metrics
+│   ├── footer.rs           # Shortcuts and transient status
+│   ├── config.rs           # Theme/panel configuration overlay
+│   ├── help.rs             # Shortcut help overlay
+│   └── view_menu.rs        # View-action overlay
 ├── collector/
-│   ├── mod.rs              # MultiCollector orchestration, orphan port detection
+│   ├── mod.rs              # AgentCollector trait, shared process data, caches/orphans
 │   ├── claude.rs           # Claude Code: session discovery, transcript parsing
-│   ├── codex.rs            # Codex CLI: session discovery via ps+lsof, JSONL parsing
-│   ├── opencode.rs         # OpenCode: session discovery via ps + SQLite DB parsing
-│   ├── process.rs          # Child process tree (ps) + open ports (lsof) + git stats
-│   └── rate_limit.rs       # Rate limit file reading (~/.claude/abtop-rate-limits.json)
+│   ├── codex.rs            # CLI/app-server discovery and rollout JSONL parsing
+│   ├── opencode.rs         # Process/cwd matching and read-only SQLite queries
+│   ├── mcp.rs              # codex mcp-server detection and rollout ownership
+│   ├── process.rs          # Platform process/port backends, process trees, Git stats
+│   └── rate_limit.rs       # Claude hook files and persistent Codex quota cache
+├── jump/
+│   ├── mod.rs              # Herdr-first routing and TerminalJumper registry
+│   ├── herdr.rs            # Codex session identity/cwd to Herdr pane
+│   ├── cmux.rs             # Workspace routing
+│   ├── tmux.rs             # Pane routing
+│   └── iterm2.rs           # macOS tty-based AppleScript routing
 └── model/
     ├── mod.rs              # Re-exports
-    └── session.rs          # AgentSession, SessionStatus, RateLimitInfo,
-                            # ChildProcess, OrphanPort, SubAgent
+    └── session.rs          # Sessions/status, quota, children/subagents, chat/tools/files
 ```
+
+Data flows from local files/process metadata through `MultiCollector` into
+`App`, then into `ui::draw` or `App::to_snapshot`. The binary and library share
+the same collection layer; there is no bundled HTTP server. `App` is not `Send`:
+keep it on its owning thread and pass serialized snapshots to other threads.
+`tick_no_summaries()` skips LLM summary jobs, but collection can still invoke
+local commands such as `ps`, `lsof`, `git`, and `sqlite3`.
 
 ## Layout
 
-```
-┌─ ¹context (token rate sparkline + per-session context bars) ─────────┐
-│  ▁▃▅▇█▇▅▃▁▃▅▇██                       S1 abtop       ████████ 82%  │
-│  token rate (200pt history)            S2 prediction  █████████91%⚠ │
-│                                        S3 api-server  ███      22%  │
-└──────────────────────────────────────────────────────────────────────┘
-┌─ ²quota ─────┐┌─ ³tokens ───┐┌─ projects ───┐┌─ ⁴ports ──────────┐
-│ CLAUDE       ││ Total  1.2M ││ abtop        ││ PORT  SESSION  CMD │
-│ 5h ████ 35%  ││ Input  402k ││  main +3 ~18 ││ :3000 api-srv node│
-│   resets 2h  ││ Output  89k ││              ││ :8080 predict crgo│
-│ 7d ██ 12%    ││ Cache  710k ││ prediction   ││                    │
-│              ││ ▁▃▅▇█▇▅▃▁▃▅││  feat/x +1~2 ││ ORPHAN PORTS       │
-│ CODEX        ││ Turns: 48   ││              ││ :4000 old-prj node│
-│ 5h █ 9%     ││ Avg: 25k/t  ││ api-server   ││                    │
-│ 7d ██ 14%    ││             ││  main ✓clean ││                    │
-└──────────────┘└─────────────┘└──────────────┘└────────────────────┘
-┌─ ⁵sessions ─────────────────────────────────────────────────────────┐
-│ ►*CC 7336 abtop  ● Work opus  82% 1.2M  48  Edit src/pay.rs       │
-│  >CD 8840 pred   ◌ Wait sonn  91% 340k  12  waiting                │
+```text
+Header: version, available host metrics, agent aggregates, clock/counts
+┌─ ¹context ───────────────────────────────────────────────────────────┐
+│ Token-rate graph (200 points) | Per-session context/window/compaction│
+└─────────────────────────────────────────────────────────────────────┘
+┌─ ²quota ───┐┌─ ³tokens ──┐┌─ ⁴projects ┐┌─ ⁵ports ──┐┌─ ⁷mcp ────┐
+│ Claude /   ││ Selected  ││ Branch /  ││ Owned /   ││ PID/profile│
+│ Codex left ││ session   ││ Git counts││ orphans   ││ Rollouts   │
+│ + resets   ││ breakdown ││           ││ conflicts ││ Activity   │
+└────────────┘└───────────┘└───────────┘└───────────┘└────────────┘
+┌─ ⁶sessions ─────────────────────────────────────────────────────────┐
+│ Responsive session table, two rows/session; optional subagent tree   │
 │ ─────────────────────────────────────────────────────────────────── │
-│  SESSION 7336 · /Users/graykode/abtop                               │
-│  Stripe payment integration...                                      │
-│  └─ Edit src/pay.rs                                                 │
-│  CHILDREN: 7401 cargo build                                         │
-│  SUBAGENTS: explore-data ✓12k · run-tests ●8k                      │
-│  MEM 4f · 12/200 │ v2.1.86 · 47m                                   │
-└──────────────────────────────────────────────────────────────────────┘
+│ Selected session: summary, chat tail, tools/children/subagents       │
+│ Optional tool timeline and file-access audit                        │
+└─────────────────────────────────────────────────────────────────────┘
+Footer: shortcuts or transient status
 ```
 
-Panel rendering priority (top to bottom):
-1. **Sessions** — always visible, gets priority allocation (min 5 rows, ideal = 2/session + 7)
-2. **Mid-tier** (quota, tokens, projects, ports) — split equally, shown if space allows
-3. **Context** — only renders when sessions have ideal height AND surplus >= 5 rows
-4. **Header** (1 row) + **Footer** (1 row) — always present
+All seven panels default to visible and can be toggled/persisted independently.
+
+Wide layout (width >= 100 columns):
+1. Reserve one row each for **header** and **footer**.
+2. Reserve up to 6 rows for enabled **mid-tier** panels (quota, tokens, projects, ports, MCP), with an ideal height of 8. Split their widths equally.
+3. Allocate **sessions** the remaining budget, with a minimum of 5 rows when space permits and an ideal height of `max(8, 2 * session_count + 7)`. The session area can absorb leftover space.
+4. Show **context** when sessions have their ideal height and at least 5 surplus rows remain; its target height is `clamp(session_count + 4, 5, 10)`. If sessions are disabled, context can use the surplus directly.
+
+Compact layout (60–99 columns, minimum height 18): **Work** contains sessions/projects,
+**Usage** contains context/quota/tokens, and **System** contains ports/MCP.
+Only the active tab renders; its enabled panels split the body vertically.
+`+`/`=` maximizes the active section and `-` restores the split. Terminals below
+60×18 show a size warning. At valid sizes, header/footer remain visible.
 
 Panel descriptions:
+
 - **¹context**: Left = token rate braille sparkline (200-point history). Right = per-session context % bars with yellow/red warning.
-- **²quota**: Claude + Codex rate limit gauges side-by-side (5h and 7d windows with reset countdown). Quota is intentionally limited to Claude and Codex; do not add an OpenCode row unless OpenCode exposes a reliable account-level provider rate-limit source.
+- **²quota**: Claude + Codex remaining-quota gauges side-by-side, with source-reported window durations and reset countdowns. Defaults are 5h/7d; Codex can report a longer window such as 30d. Quota is intentionally limited to Claude and Codex; do not add an OpenCode row unless OpenCode exposes a reliable account-level provider rate-limit source.
 - **³tokens**: Total token breakdown (in/out/cache) + per-turn sparkline for selected session.
-- **projects** (always visible): Per-project git branch + added/modified file counts.
-- **⁴ports**: Agent-spawned open ports + orphan ports (from dead sessions). Conflict detection.
-- **⁵sessions**: Full-width panel below mid row. Session list table (top) + selected session detail (bottom), separated by divider.
+- **⁴projects**: Per-project git branch + added/modified file counts.
+- **⁵ports**: Agent-spawned open ports + orphan ports (from dead sessions). Conflict detection.
+- **⁶sessions**: Session list table (or subagent tree) + selected session detail, separated by a divider. Detail defaults to bounded chat messages; timeline and file audit are optional views. Columns adapt to available width.
+- **⁷mcp**: Detected `codex mcp-server` PIDs, parent CLI/profile, active/total rollout counts, and latest activity age. This is not a general MCP-service inventory.
 
 ## Data Sources
 
-All read-only from local filesystem + `ps` + `lsof`. No API calls, no auth.
+Monitoring uses local filesystem/process state without API keys or service auth.
+On macOS, process enumeration uses `ps`, Claude open-path discovery uses
+`proc_pidinfo` with `lsof` fallback, and ports/Codex open files use `lsof`.
+Linux reads `/proc` directly; Windows uses `sysinfo`, `netstat -ano`, and
+filesystem-based discovery fallbacks. OpenCode uses `sqlite3 -readonly -json`.
+Monitoring does not modify agent transcripts or the OpenCode DB; abtop does
+write its own config/cache files. Summary generation, setup, self-update,
+terminal jumps, and explicit process termination are separate actions.
 
 ### 1. Claude Code session discovery: process + config-root mapping
 
 Discovery strategy:
-1. Find running `claude` processes via `ps`
-2. Map PID → open files/directories via `lsof`
+1. Find running `claude` processes in shared platform process data
+2. Map PID → open files/directories via platform-specific discovery
 3. Infer Claude config roots from open paths that contain `sessions/` and `projects/`
 4. Read `{config-root}/sessions/{PID}.json`, falling back to scanning session files for the matching embedded PID
 5. Parse `{config-root}/projects/{encoded-path}/{sessionId}.jsonl`
 
-Fallback config roots are still scanned: `~/.claude`, direct home profile roots matching `~/.claude-*` when they contain both `sessions/` and `projects/`, `claude_config_dirs` from `~/.config/abtop/config.toml`, abtop's own `CLAUDE_CONFIG_DIR`, and on Linux any `CLAUDE_CONFIG_DIR` read from `/proc/{pid}/environ`.
+Fallback config roots are still scanned: `~/.claude`, direct home profile roots matching `~/.claude-*` when they contain both `sessions/` and `projects/`, `claude_config_dirs` from `<config-dir>/abtop/config.toml` (`dirs::config_dir()`), abtop's own `CLAUDE_CONFIG_DIR`, and on Linux any `CLAUDE_CONFIG_DIR` read from `/proc/{pid}/environ`.
 
 Session file format:
 ```json
 { "pid": 7336, "sessionId": "2f029acc-...", "cwd": "/Users/graykode/abtop", "startedAt": 1774715116826, "kind": "interactive", "entrypoint": "cli" }
 ```
+
 - ~170 bytes. Created on start, deleted on exit.
-- Verify PID alive with shared `ps` data containing a `claude` binary.
+- Verify PID alive with shared process data containing a `claude` binary.
 - Skip sessions whose PID descends from abtop's own `claude --print` summary children without hiding user-spawned non-interactive sessions.
 
 ### 2. Claude Code transcript: `{config-root}/projects/{encoded-path}/{sessionId}.jsonl`
@@ -144,16 +173,18 @@ Key line types:
 
 - **Size: 1KB–18MB**. Append-only, new line per message.
 - **Reading strategy**: On first discovery, scan full file to build cumulative token totals. Then watch file size — on growth, read only new bytes appended since last read (track file offset). This gives both lifetime totals and real-time updates without re-reading.
-- **Partial line handling**: new bytes may end mid-JSON-line. Buffer incomplete lines until next read.
-- **File rotation**: if file shrinks (session restart), reset offset to 0 and re-scan.
+- **Partial line handling**: leave the offset before incomplete invalid JSON and retry those bytes on the next read. Valid JSON without a trailing newline is accepted. Complete malformed lines are skipped; reads cap individual lines at 10 MiB.
+- **File rotation**: if the file shrinks or its identity changes, reset and re-scan.
 
-### 3. Codex CLI sessions: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
+### 3. Codex CLI and desktop sessions: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
 
 Discovery strategy:
-1. Find running `codex` processes via `ps`
-2. Map PID → open `rollout-*.jsonl` file via `lsof`
-3. Parse JSONL for `session_meta`, `token_count` (includes rate_limits), `agent_message` events
-4. Detect finished sessions: scan today's directory for JSONL < 5 min old not owned by running process
+1. Find running CLI processes and `codex app-server` hosts from shared process data.
+2. Map CLI PID → open rollout via `lsof` on macOS, `/proc/{pid}/fd` on Linux, or recent-file heuristics on Windows.
+3. Parse `session_meta`, `turn_context`, `event_msg` (including `token_count`), `response_item`, and newer `item_completed` wrappers for metadata, tokens, chat, and tool lifecycle. Codex currently re-parses selected files from the beginning on each collection; it does not use Claude's incremental offset cache.
+4. Discover recent desktop rollouts (30-minute activity threshold) from the filesystem first; background open-file scans refine PID ownership. Background scans also cover older day directories, at most once per minute. Unconfirmed owners are `Unknown` with PID 0. Guardian review rollouts are excluded.
+5. Recognize daemon-backed CLI rollouts using app-server ownership without attaching the shared host's children/memory to each session. Desktop sessions likewise do not inherit the shared host's process tree.
+6. Scan today's unowned rollouts for recently finished sessions (< 5 minutes); `MultiCollector` removes `Done` rows from the displayed result. MCP-owned rollouts are suppressed by default and shown in the MCP panel instead.
 
 Rate limits extracted from `token_count` events:
 ```json
@@ -167,21 +198,33 @@ Rate limits extracted from `token_count` events:
 }
 ```
 
+Only account-level limits (`limit_id` absent or `codex`) are accepted; model-specific
+limits are ignored. Window durations are preserved. The latest values are written
+to `<cache-dir>/abtop/codex-rate-limits.json` and used when no live session reports
+limits. Both Claude and Codex readers retain old values; the quota UI dims a
+source after 10 minutes and hides its reset countdowns.
+
 ### 4. OpenCode sessions: `~/.local/share/opencode/opencode.db`
-- Discover running `opencode` processes via shared `ps` data.
-- Read recent sessions from OpenCode's SQLite DB through `sqlite3 -readonly -json`.
+
+- Discover running `opencode` processes via shared process data.
+- Read recent sessions from OpenCode's SQLite DB through `sqlite3 -readonly -json` on slow ticks and reuse cached rows between queries. Windows also probes `%LOCALAPPDATA%/opencode` and `%APPDATA%/opencode`.
 - Match live PIDs to DB sessions by process cwd. OpenCode does not expose a PID/session mapping, so when multiple DB rows share one cwd, only live PIDs should be assigned and older rows should not be shown as live duplicates.
 - OpenCode contributes session/token/project/port data, but not quota data. Quota remains Claude + Codex only.
 
 ### 5. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
+
 - `agent-{hash}.jsonl` — same JSONL format as main transcript
 - `agent-{hash}.meta.json` — `{ "agentType": "general-purpose", "description": "..." }`
 
-### 6. Process tree: `ps` + `lsof`
+### 6. Process tree and ports
+
+On macOS, the equivalent commands are:
 ```bash
 ps -eo pid,ppid,rss,%cpu,command    # All processes
 lsof -i -P -n -sTCP:LISTEN         # Open ports
 ```
+
+- Linux uses `/proc` process/socket data; Windows uses `sysinfo` and `netstat -ano`.
 - Build parent→children map from ppid
 - Map listening PID → parent agent PID → session
 
@@ -191,6 +234,7 @@ git -C {cwd} status --porcelain     # added/modified file counts
 ```
 
 ### 8. Memory status
+
 - Path: `~/.claude/projects/{encoded-path}/memory/`
 - Count files in directory + lines in `MEMORY.md`
 
@@ -198,7 +242,10 @@ git -C {cwd} status --porcelain     # added/modified file counts
 
 NOT in transcript JSONL. Collected via StatusLine mechanism.
 
-`abtop --setup` automates this: creates a script at `~/.claude/abtop-statusline.sh` that writes rate limit JSON to `~/.claude/abtop-rate-limits.json`, and registers it in `~/.claude/settings.json`.
+`abtop --setup` creates `abtop-statusline.sh` and registers it in `settings.json`
+under an existing `CLAUDE_CONFIG_DIR`, or `~/.claude` otherwise. The Bash hook
+uses `python3` to write `abtop-rate-limits.json` under its runtime
+`CLAUDE_CONFIG_DIR` (default `~/.claude`).
 
 File format read by abtop:
 ```json
@@ -209,65 +256,86 @@ File format read by abtop:
   "updated_at": 1774714400
 }
 ```
-- Rejects stale data (> 10 minutes old).
-- `rate_limits` only present for Pro/Max subscribers.
+
+- Keeps stale data; after 10 minutes the quota UI dims the source and suppresses reset countdowns.
+- Requires Claude Code to supply `rate_limits` in its StatusLine input; availability depends on the account/provider.
 - Account-level metric, shared across all sessions.
 - Show "—" when not configured or data unavailable.
 
-### 10. Other files
-- `~/.claude/stats-cache.json` — daily aggregates. Only updated on `/stats`, NOT real-time.
-- `~/.claude/history.jsonl` — prompt history with sessionId.
+### 10. MCP and host metrics
+
+- `collector/mcp.rs` detects `codex mcp-server`, its parent CLI/profile, and open rollout files. A rollout counts as active only when its mtime is less than 30 minutes old; an open fd alone is not activity.
+- `host_info.rs` samples CPU/memory/one-minute load from `/proc` on Linux and CPU/memory via `sysinfo` on Windows (load is 0). macOS currently returns no host metrics; agent/session aggregates still render.
+
+Claude's `stats-cache.json` and `history.jsonl` are not live-monitor inputs; do not use stale daily aggregates as a substitute for transcript collection.
 
 ## Session Status Detection
 
 ```
-● Working  = PID alive + transcript mtime < 30s ago
-◌ Waiting  = PID alive + transcript mtime > 30s ago
-✗ Error    = PID alive + last assistant has error content
-✓ Done     = PID dead (detected via kill(pid, 0) failure)
+◉ Thinking    = model generation inferred from transcript/events
+● Executing   = pending tool, active descendant, or working Claude subagent
+◌ Waiting     = completed turn, user/permission wait, or no active signal
+? Unknown     = recent Codex rollout without confirmed process ownership
+⏳ RateLimited = Waiting + same-agent quota usage > 90% in either window
+✓ Done        = collector reports finished/dead session; filtered from live results
 ```
 
-**Done detection**: session files are deleted on normal exit, but may linger briefly or survive crashes. When PID is dead but file exists, show as Done and clean up on next tick.
+Claude uses pending tool calls, active descendants (> 5% CPU), working subagents,
+and real user prompts awaiting a reply. It does not gate Thinking on transcript
+mtime: a long streamed response may not update the file until it completes.
+Codex uses task/turn completion, user-input requests, pending tool lifecycle, and
+generation events; completed interactive turns are Waiting, whereas completed
+`codex exec` sessions are Done. OpenCode uses DB updates within 30 seconds or
+CPU activity (agent > 1%, descendants > 5%) to infer Thinking, otherwise Waiting.
+There is no `Working` or `Error` variant in the current `SessionStatus` enum.
 
-**PID reuse risk**: verify PID is still the expected agent process (Claude, Codex, or OpenCode) by checking `ps -p {pid} -o command=`. Don't trust PID alone.
+Dead Claude/OpenCode sessions are omitted by their collectors. Codex may emit
+Done internally, but `MultiCollector` removes Done from the final session list;
+abtop does not delete agent session files.
+
+**PID reuse risk**: discovery checks expected agent commands in fresh shared process data. Destructive actions additionally re-check `ps -p {pid} -o command=`. Don't trust PID alone.
 
 Current task (2nd line under each session):
-- Working → last `tool_use` name + first arg (e.g. `Edit src/main.rs`)
-- Waiting → "waiting for user input"
-- Error → last error message (truncated)
-- Done → "finished {duration} ago"
+
+- Executing → tool name + bounded argument preview (e.g. `Edit src/main.rs`)
+- Thinking → "thinking..." when no tool preview is present
+- Waiting → "waiting for input"
+- Unknown → "unknown"
 
 **Known limitations** (all heuristic):
-- Cannot distinguish model-thinking vs tool-executing vs rate-limit-waiting vs permission-prompt
-- "Waiting" may be wrong if a long-running tool (cargo build, npm test) is running
+
+- Thinking/Executing are inferred from recorded events and CPU activity, not authoritative provider status.
+- Waiting can include a permission prompt; RateLimited is inferred from quota saturation rather than an explicit provider wait event.
+- Shared app-server ownership does not prove a specific desktop session is running a tool; Unknown avoids presenting an unowned rollout as confirmed live work.
 - Status is best-effort, not authoritative
 
 ## Session Summary Generation
 
 Each session gets a one-line summary title generated via `claude --print`:
+
 - Spawned as background process with 10s timeout
-- Rejects generic/empty output; falls back to sanitized first prompt (28 chars)
-- Cached to `~/.cache/abtop/summaries.json` (persists across runs)
-- Max 3 concurrent summary jobs, max 2 retries per session
+- Uses up to 200 characters each from the initial prompt and first assistant text. Rejects generic/empty/overlong output; falls back to sanitized prompt text (up to 80 characters). Display fallback can also use first assistant text.
+- Cached to `<cache-dir>/abtop/summaries.json` via `dirs::cache_dir()` (persists across runs; typically `~/.cache` on Linux and `~/Library/Caches` on macOS).
+- Max 3 concurrent summary jobs, max 2 attempts per session. `--once` allows up to 30 seconds for jobs/retries; `--json` and `tick_no_summaries()` do not start summary jobs.
 
 ## Context Window Calculation
 
-Not provided in data files. Derive:
-- **Window size**: hardcode by model name
-  - `claude-opus-4-6` → 200,000 (default)
-  - `claude-opus-4-6[1m]` → 1,000,000
-  - `claude-sonnet-4-6` → 200,000
-  - `claude-haiku-4-5` → 200,000
-- **Current usage**: last `assistant` line's `input_tokens + cache_read_input_tokens`. `cache_creation_input_tokens` is intentionally excluded — on compaction turns the same tokens can be reported as both `cache_creation` *and* `cache_read`, and summing all three double-counts (#54). Matches Claude Code's own statusline and the Codex collector.
+- **Claude window size**: default 200,000; use 1,000,000 if the transcript/configured model contains `[1m]` or the maximum observed context exceeds 200,000. This is a heuristic, not a complete model catalog.
+- **Claude current usage**: last assistant usage's `input_tokens + cache_read_input_tokens`. If cache read is zero and cache creation is positive, use `input_tokens + cache_creation_input_tokens` for fresh-cache context. Never sum both cache fields, which can double-count compaction turns (#54).
+- **Codex**: read `model_context_window` from events and use `last_token_usage.input_tokens` directly; cached input is already included.
+- **OpenCode**: no context-window percentage is provided.
 - **Percentage**: current_usage / window_size * 100
-- **Warning**: yellow at 80%, red at 90%, ⚠ icon at 90%+
+- **Display**: theme gradients reflect usage; the context panel adds `!` at 75%+ and a ⚠ icon at 90%+.
+- **Claude compaction**: infer from a context drop greater than 30% combined with a large cache-read drop; retain history/counts for the UI.
 
 ## Orphan Port Detection
 
 Tracks child processes that have open ports. When a parent session dies but the child process remains alive and listening:
+
 - Added to `orphan_ports` list automatically
 - Displayed in ports panel under "ORPHAN PORTS" section
-- Can be killed via `X` (Shift+X) with safety checks (fresh port scan + PID command verification before SIGKILL)
+- Can be terminated via `X` (Shift+X) with safety checks: fresh port scan + exact PID command verification before invoking `kill` with its default signal (SIGTERM on Unix).
+- Requires history across ticks; a fresh one-shot snapshot has no previously tracked orphans.
 
 ## Key Bindings
 
@@ -275,22 +343,54 @@ Tracks child processes that have open ports. When a parent session dies but the 
 |-----|--------|
 | `↑`/`↓` or `k`/`j` | Select session in list |
 | `Enter` | Jump to session pane (Herdr Codex / cmux / tmux / iTerm2) |
-| `x` | Kill selected session (SIGKILL) |
-| `X` | Kill all orphan ports |
+| `x` twice within 2s | Kill selected session (SIGKILL) after PID verification; Unknown/Done and shared Codex app-server hosts are protected |
+| `X` | Terminate verified orphan port processes |
+| `t` | Cycle and persist theme |
+| `1`–`7` | Toggle context, quota, tokens, projects, ports, sessions, MCP |
+| `T` | Toggle subagent tree view |
+| `l` / `L` | Toggle tool timeline |
+| `f` / `F` | Toggle file audit |
+| `/` | Enter session filter; Enter ends editing, Esc clears |
+| `c` | Open/close config overlay; Esc/q also close it |
+| `v` | Open/close view menu; Esc also closes it |
+| `?` | Open help; any key dismisses it |
+| `←`/`→`, `Tab`/`Shift+Tab` | Previous/next compact tab |
+| `w` / `u` / `s` | Select compact Work / Usage / System tab |
+| `+` / `=` / `-` | Maximize/restore compact section |
+| `M` | Toggle suppression of MCP-owned sessions |
 | `q` | Quit |
 | `r` | Force refresh |
 
 ## Tech Stack
 
-- **Rust** (2021 edition)
-- **ratatui** + **crossterm** for TUI
+- **Rust** (2021 edition; minimum Rust 1.88)
+- **ratatui 0.29**: layout, tables, paragraphs, borders and frame rendering; custom bars/gradients/Braille graphs live in `ui/mod.rs`.
+- **crossterm 0.28**: terminal backend, raw/alternate-screen setup, keyboard/mouse events. Mouse capture is opt-in (`--mouse`).
 - **serde** + **serde_json** for JSON/JSONL parsing
 - **chrono** for timestamp formatting
-- **dirs** for home directory resolution
-- **Polling intervals** (staggered to avoid freezes):
-  - Session scan + transcript tail: every 2s
-  - Process tree (ps): every 2s
-  - Port scan (lsof) + git status + rate limits: every 10s (5 ticks)
+- **dirs** for platform home/config/cache directories; **unicode-width** for display widths; **tempfile** for the updater download.
+- Platform dependencies: **proc_pidinfo** on Apple targets, **libc** on Linux, **sysinfo** on Windows. SQLite access uses the external `sqlite3` CLI.
+- **Scheduling** (polling, not a filesystem watcher):
+  - Input polling/rendering: 500ms idle interval; input can trigger earlier redraws.
+  - Session collection + process tree + host sampling: target 2s; ticks are deferred while handling input. Claude tails incrementally, Codex re-parses, OpenCode reuses DB cache.
+  - Ports + Git + OpenCode DB: every 5 ticks (~10s); port PID-set changes and new Git cwd entries trigger earlier work.
+  - Quota: first tick, then every 6 ticks (~12s) with the current counter; if no data is available, retry every tick.
+  - Desktop rollout background scanners: at most once per minute; open-file scanner has a 90s timeout.
+
+## Library / JSON Snapshot
+
+The supported library surface includes `app`, `snapshot`, `config`, `demo`,
+`host_info`, and `model`. Internal collector/UI helpers may change without a
+major version bump. `App::tick_no_summaries()` refreshes monitored data without
+LLM summary jobs; `App::to_snapshot(interval_ms)` is a pure read that creates an
+owned JSON-serializable DTO. There is no HTTP listener in this crate.
+
+Snapshots include host/agent aggregates, sessions, rate limits, orphan ports,
+MCP servers, and bounded per-session token/tool/chat/subagent detail; full
+transcripts and the file-access audit are omitted. `token_rate` is the per-tick
+delta of input + output + cache creation, excluding cache reads; divide by
+`interval_ms / 1000` for a per-second rate. Status variants serialize as
+CamelCase (`Thinking`, `Executing`, etc.); chat roles are `user`/`assistant`.
 
 ## Commit Convention
 
@@ -299,12 +399,29 @@ Tracks child processes that have open ports. When a parent session dies but the 
 ```
 Types: `feat`, `fix`, `refactor`, `docs`, `chore`
 
+## Documentation Maintenance
+
+Treat current source as the authority and update both this guide and README.md
+when changing modules, CLI flags/key handling, panel layout, collection/status
+heuristics, snapshot fields, or privacy behavior. Check `Cargo.toml` for dependency
+versions, `lib.rs` for CLI/input dispatch, `ui/mod.rs` for sizing/layout, and
+the relevant collector for discovery/status rules. Distinguish per-platform
+behavior and heuristics from guarantees; do not describe comments or intended
+behavior as implemented when the code differs.
+
 ## Commands
 
 ```bash
 cargo build                    # Build
 cargo run                      # Run TUI
 cargo run -- --once            # Print snapshot and exit
+cargo run -- --json            # Print a JSON snapshot without summary jobs
+cargo run -- --demo            # Run TUI with synthetic data
+cargo run -- --demo --json     # Print a synthetic JSON snapshot
+cargo run -- --mouse           # Enable click/scroll navigation
+cargo run -- --theme dracula   # Choose a built-in theme
+cargo run -- --version         # Print package version
+cargo run -- --update          # Download/run the GitHub shell installer (requires curl/sh)
 cargo run -- --setup           # Install StatusLine hook for rate limit collection
 cargo run -- --exit-on-jump    # Quit after Enter-jumping to a session terminal (for popup overlays)
 cargo test                     # Tests
@@ -344,11 +461,11 @@ cargo clippy                   # Lint
 **Do NOT push the tag before the version bump is on `main`.**
 **Do NOT reuse a release tag after a failed publish; bump to a new patch version instead.**
 
-## Non-Goals (v0.1)
+## Current Scope Limits
 
-- Gemini/Cursor support
+- Additional agent backends such as Gemini or Cursor (Claude IDE-extension discovery is supported)
 - Cost estimation
-- Remote/SSH monitoring
+- Built-in HTTP server or remote/SSH monitoring (external consumers can use snapshots)
 - Notifications/alerts
 
 ## Terminal Jump (`Enter`)
@@ -368,6 +485,7 @@ The logic lives in `src/jump/` as a registry of `TerminalJumper` adapters
 `resolve()` walks it and the first applicable adapter wins.
 
 Each adapter returns a three-way `JumpAttempt`:
+
 - `NotApplicable` — not this backend's terminal; try the next adapter.
 - `Jumped` — focused successfully; stop.
 - `Failed(msg)` — this backend owns the process but the focus command errored;
@@ -393,26 +511,28 @@ Parsing/registry logic is unit-tested in `jump/mod.rs`; the thin `ps`/`osascript
 ## Privacy
 
 abtop reads transcripts, prompts, tool inputs, and memory files. These may contain secrets.
-- **`--once` output**: redact file contents from tool_use inputs. Show tool name + file path only, not content.
-- **TUI mode**: show tool name + first arg (file path), never show file contents or prompt text in session list.
-- **No network**: abtop never sends data anywhere. All local reads.
-- **Exception**: summary generation calls `claude --print` locally (no network by abtop itself, but claude may use its API).
+
+- **Tool display**: collectors keep bounded tool argument previews (paths/command prefixes/patterns), not full edit/write contents. Known secret prefixes are redacted and terminal control/bidi characters are sanitized where transcript display data is built; this is best-effort, not a guarantee that all secrets are removed.
+- **TUI/`--once` summaries**: generated titles or sanitized prompt/assistant-text fallbacks can reveal conversation context. The selected TUI detail also shows up to 12 redacted chat messages by default; timeline/file-audit views expose local activity metadata.
+- **JSON snapshots**: include summaries, chat tails, cwd/config roots, tool previews and child commands. Treat them as private data; external consumers must provide their own access controls.
+- **Network**: collection itself makes no provider API calls. Summary jobs send bounded prompt/assistant context through `claude --print`, which may call the provider. Explicit `--update` downloads and runs the GitHub installer via `curl`/`sh`.
+- **Local writes/actions**: own config/cache persistence and explicit setup/kill/jump/update operations mean the entire application is not strictly read-only.
 
 ## Gotchas
 
-- **Transcript size**: 1KB–18MB. On first load, full scan for totals. After that, track file offset and read only new bytes. Buffer partial lines.
+- **Transcript size**: Claude scans fully once, then tracks offset/identity and retries incomplete bytes. Codex currently re-parses each selected rollout from the beginning; avoid assuming all collectors have an incremental cache.
 - **Session file deletion**: files disappear when Claude exits. Handle `NotFound` between scan and read.
 - **stats-cache.json is stale**: only updated on `/stats` command. Don't use for live data.
-- **Context window not in data**: must hardcode per model. Will break if Anthropic/OpenAI add new models.
+- **Context window**: Claude's 200K/1M inference can misclassify new models; Codex relies on reported window metadata. Neither is an authoritative live provider API.
 - **Rate limit is account-level**: shared across all sessions. Don't show per-session.
 - **Path encoding**: `/Users/foo/bar` → `-Users-foo-bar`. Used for transcript directory names.
 - **Path encoding collision**: `-Users-foo-bar-baz` could be `/Users/foo/bar-baz` or `/Users/foo-bar/baz`. Use session JSON's `cwd` as source of truth.
-- **lsof can be slow**: on macOS with many open files. Cache results, poll every 10s.
+- **lsof can be slow**: macOS port scans are cached on slow ticks; desktop rollout ownership uses a background scanner. Some CLI/MCP discovery still performs local commands during collection.
 - **Child process tree**: `pgrep -P` only gets direct children. Build full tree from `ps -eo ppid`.
 - **Port detection race**: a port can close between lsof and display. Show stale data gracefully.
 - **Subagent directory may not exist**: only created when Agent tool is used. Check existence before scanning.
 - **Undocumented internals**: all data sources are Claude Code/Codex implementation details, not stable APIs. Schema may change without notice. Defensive parsing with `serde(default)` everywhere.
-- **Terminal size**: minimum 80x24. Panels degrade gracefully when small (context panel hidden first).
+- **Terminal size**: minimum 60x18; below 100 columns use compact tabs. Wide layout reserves mid-tier space before allocating sessions and shows context only with surplus.
 - **PID reuse in port cache**: invalidate cached ports when the set of tracked PIDs changes.
-- **Rate limit staleness**: reject rate limit data older than 10 minutes.
+- **Rate limit staleness**: old values remain available; quota sources dim after 10 minutes and reset countdowns disappear. RateLimited promotion still uses retained percentages, so it is a heuristic.
 - **`/clear` + multi-PID same cwd**: after `/clear`, Claude Code mints a new `sessionId` + `.jsonl` without rewriting `sessions/{PID}.json`. abtop overrides the stale sid by picking the newest transcript in the project dir, but this heuristic can't disambiguate ownership when two live `claude` PIDs share a cwd — so the override is disabled in that case and both sessions keep their original sid until exit. Use separate worktrees if live tracking is needed on both simultaneously.
