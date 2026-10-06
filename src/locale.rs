@@ -24,6 +24,7 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("sess.exec", "● Exec");
     m.insert("sess.wait", "◌ Wait");
     m.insert("sess.unknown", "? Unknown");
+    m.insert("sess.error", "✗ Error");
     m.insert("sess.rate", "⏳ Rate");
     m.insert("sess.done", "✓ Done");
 
@@ -275,6 +276,7 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("sess.exec", "● 执行");
     m.insert("sess.wait", "◌ 等待");
     m.insert("sess.unknown", "? Unknown");
+    m.insert("sess.error", "✗ 错误");
     m.insert("sess.rate", "⏳ 限速");
     m.insert("sess.done", "✓ 完成");
 

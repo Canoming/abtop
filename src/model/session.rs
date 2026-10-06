@@ -64,8 +64,10 @@ pub enum SessionStatus {
     Executing,
     /// Idle, waiting for user input or permission prompt
     Waiting,
-    /// Session appears recent, but process ownership is not confirmed
+    /// Runtime status or exclusive process ownership cannot be confirmed.
     Unknown,
+    /// Codex reports a runtime system error.
+    Error,
     /// Waiting due to rate limit
     RateLimited,
     /// Session finished

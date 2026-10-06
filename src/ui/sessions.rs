@@ -154,6 +154,7 @@ pub(crate) fn draw_sessions_panel_active(
             crate::model::SessionStatus::Executing => (t("sess.exec"), theme.hi_fg),
             crate::model::SessionStatus::Waiting => (t("sess.wait"), grad_at(&proc_grad, 50.0)),
             crate::model::SessionStatus::Unknown => (t("sess.unknown"), theme.inactive_fg),
+            crate::model::SessionStatus::Error => (t("sess.error"), theme.status_fg),
             crate::model::SessionStatus::RateLimited => (t("sess.rate"), theme.status_fg),
             crate::model::SessionStatus::Done => (t("sess.done"), theme.inactive_fg),
         };

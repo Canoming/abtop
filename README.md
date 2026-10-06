@@ -3,7 +3,7 @@
 **Like [btop](https://github.com/aristocratos/btop), but for your AI coding agents.**
 
 See Claude Code, Codex CLI/desktop, and OpenCode sessions at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
-Sessions are discovered from local process/file state across macOS, Linux, and Windows. Claude Code discovery supports multiple active profile roots and CLI, desktop-app, and IDE-extension processes.
+Sessions are discovered from local process/file state across macOS, Linux, and Windows, with read-only Codex app-server queries on macOS/Linux. Claude Code discovery supports multiple active profile roots and CLI, desktop-app, and IDE-extension processes.
 
 ![demo](https://raw.githubusercontent.com/graykode/abtop/main/assets/demo.gif)
 
@@ -106,19 +106,36 @@ tmux new -s work
 
 OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` (also the default location on Windows; `%LOCALAPPDATA%\opencode` and `%APPDATA%\opencode` are probed as fallbacks) and requires `sqlite3` in `PATH` (on Windows: `winget install SQLite.SQLite`).
 
-Codex desktop/app-server sessions are discovered from recent rollout files,
-with background open-file scans to confirm ownership. Sessions with unconfirmed
-ownership show **Unknown** and PID 0; shared app-server memory/children are not
-attributed to individual sessions. Guardian review rollouts are excluded.
+Codex uses an existing local app-server socket on macOS/Linux to query
+`thread/loaded/list` and `thread/read` metadata/status. Loaded idle sessions stay
+visible regardless of rollout age; no daemon is started and no thread is resumed.
+Default `~/.codex`, `CODEX_HOME`, and roots discovered through open rollouts are
+queried. Rows are deduplicated by config root and thread ID; loaded subagent/fork
+threads remain distinct rows. Guardian review threads are excluded.
+
+Standalone CLI sessions still use verified processes/open rollouts. Unreachable
+app-server instances fall back to open files and recent rollouts (30-minute
+threshold, scanned at most once a minute), shown as **Unknown** with PID 0.
+Windows uses recent-file Unknown candidates without assigning guessed PIDs.
+Shared app-server memory/children are not attributed to individual sessions.
+The socket only exposes its own instance; unavailable/independent instances
+cannot always be discovered or classified authoritatively.
 The MCP panel currently detects `codex mcp-server` processes, rather than all
 MCP services; their rollouts are suppressed from the session list by default
 (`M` toggles this).
 
-Session states are **Thinking**, **Executing**, **Waiting**, **Unknown**, and
-**RateLimited**. Status is inferred from transcript/tool events, process activity,
-or OpenCode DB updates. Waiting sessions are marked RateLimited when a retained
-same-agent account quota exceeds 90%; this does not prove a provider is blocking
-the session. Finished (`Done`) rows are filtered from the live list.
+Session states are **Thinking**, **Executing**, **Waiting**, **Unknown**,
+**Error**, and **RateLimited**. Codex runtime status takes precedence over rollout
+heuristics: idle and approval/user-input waits become Waiting, active tools become
+Executing, other active turns become Thinking, and system errors become Error.
+Thinking versus Executing is refined from recorded tools, not exact model telemetry.
+Failed queries preserve previous metadata as Unknown while the server remains
+alive; successful queries remove unloaded threads from that instance.
+
+Other agents infer status from transcript/tool events, process activity, or
+OpenCode DB updates. Non-Codex Waiting sessions can be marked RateLimited when
+same-agent account quota exceeds 90%; this does not prove blocking. Codex waits
+are not changed by account usage. Finished (`Done`) rows are filtered out.
 
 Quota is account-level and limited to Claude/Codex. Gauges show **remaining**
 quota; window labels follow reported durations (normally 5h/7d, sometimes 30d).
@@ -220,8 +237,8 @@ When `language` is unset, abtop auto-detects from `LANG` — any value starting 
 | `q`                | Quit                                 |
 | `r`                | Force refresh                        |
 
-Unknown/Done sessions cannot be killed, and PID verification refuses shared
-Codex app-server hosts. Orphan termination rechecks listening ports and requires
+Unknown/Done sessions and PID 0 rows cannot be killed; PID verification also
+refuses shared Codex app-server hosts. Orphan termination rechecks listening ports and requires
 an exact command match. Orphan detection needs history across collection ticks,
 so a fresh one-shot snapshot has no previously tracked orphan ports.
 
@@ -233,7 +250,7 @@ terminal backend and keyboard/mouse events. Gradient meters and Braille graphs
 are custom rendering helpers; there is no additional TUI component framework.
 
 ```text
-Local transcripts / SQLite / process state
+Local transcripts / SQLite / process state / Codex local socket
                   ↓
             MultiCollector
                   ↓
@@ -260,8 +277,14 @@ every 2 seconds, deferring collection while handling input. Ports/Git/OpenCode
 DB refresh every 5 ticks (~10 seconds), with earlier port refreshes on PID-set
 changes. Quota refreshes initially, then every 6 ticks (~12 seconds), or every
 tick when no data is available. Claude parsing is incremental; Codex currently
-re-parses selected rollouts. Slow desktop rollout discovery and summary jobs
-run in background threads.
+re-parses selected rollouts once per canonical path in each tick. A single Codex
+worker queries native status and performs compatibility discovery without blocking
+the TUI. Open files refresh on slow ticks/PID changes, with a two-second macOS
+scan timeout; recent fallback files refresh at most once a minute. Socket RPCs
+have two-second I/O timeouts. Summary jobs also run in background threads.
+`--json` and `--once` wait up to ten seconds for initial discovery. Library callers
+can tick, call `App::wait_for_discovery(timeout)`, and tick again before their
+first snapshot; ongoing polling applies background results automatically.
 
 Linux reads `/proc` for process/port and host metrics. macOS uses `ps`,
 `proc_pidinfo`/`lsof` for process/open-file discovery; host CPU/memory/load metrics

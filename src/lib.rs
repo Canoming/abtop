@@ -145,7 +145,7 @@ pub fn run() -> io::Result<()> {
     let mouse_capture = should_enable_mouse_capture(std::env::args());
 
     // --json flag: print a machine-readable JSON snapshot and exit.
-    // Single tick, no summary subprocesses. Useful for scripting and as a
+    // Wait for initial background discovery without summary subprocesses. Useful for scripting and as a
     // manual check of the web snapshot API; the web tool uses the library
     // `App::to_snapshot` directly rather than shelling out to this.
     if std::env::args().any(|a| a == "--json") {
@@ -153,6 +153,8 @@ pub fn run() -> io::Result<()> {
         if demo_mode {
             demo::populate_demo(&mut app);
         } else {
+            app.tick_no_summaries();
+            app.wait_for_discovery(Duration::from_secs(10));
             app.tick_no_summaries();
         }
         match serde_json::to_string_pretty(&app.to_snapshot(2000)) {
@@ -173,6 +175,8 @@ pub fn run() -> io::Result<()> {
         if demo_mode {
             demo::populate_demo(&mut app);
         } else {
+            app.tick_no_summaries();
+            app.wait_for_discovery(Duration::from_secs(10));
             app.tick();
             // Wait for summaries: retry-aware budget (up to 30s total to allow 2 × 10s attempts + slack)
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -458,6 +462,7 @@ fn print_snapshot(app: &App) {
             model::SessionStatus::Executing => "● Exec",
             model::SessionStatus::Waiting => "◌ Wait",
             model::SessionStatus::Unknown => "? Unknown",
+            model::SessionStatus::Error => "✗ Error",
             model::SessionStatus::RateLimited => "⏳ Rate",
             model::SessionStatus::Done => "✓ Done",
         };

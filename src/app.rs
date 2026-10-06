@@ -499,12 +499,15 @@ impl App {
         self.drain_and_retry_summaries();
     }
 
-    /// Refresh all monitored data WITHOUT spawning background summary jobs.
-    ///
-    /// `tick` additionally calls [`App::drain_and_retry_summaries`], which
-    /// shells out to `claude --print` to generate session titles. Headless
-    /// consumers (e.g. the web snapshot API) call this variant so they never
-    /// spawn subprocesses or consume the user's Claude quota.
+    /// Wait for a background discovery pass; call tick again to apply its result.
+    /// Useful for one-shot snapshots. Interactive polling does not need this.
+    pub fn wait_for_discovery(&mut self, timeout: std::time::Duration) {
+        self.collector.wait_for_discovery(timeout);
+    }
+
+    /// Refresh monitored data without starting LLM summary jobs.
+    /// Initial Codex discovery is asynchronous; one-shot callers can use
+    /// [`App::wait_for_discovery`] and tick again before taking a snapshot.
     pub fn tick_no_summaries(&mut self) {
         self.collector.set_mcp_suppress(self.mcp_suppress_sessions);
         self.sessions = self.collector.collect();
@@ -712,6 +715,10 @@ impl App {
             return;
         }
         let session = &self.sessions[self.selected];
+        if session.pid == 0 {
+            self.set_status("This session has no exclusive process to kill".to_string());
+            return;
+        }
         if matches!(session.status, SessionStatus::Done | SessionStatus::Unknown) {
             return;
         }
@@ -975,15 +982,14 @@ fn save_summary_cache(summaries: &HashMap<String, String>) {
 /// before the account actually blocks.
 const RATE_LIMITED_PCT: f64 = 90.0;
 
-/// Promote Waiting sessions to RateLimited when a rate limit from the SAME
-/// agent CLI is over `RATE_LIMITED_PCT`. Matching on source avoids a
-/// Claude-only saturation freezing Codex sessions and vice versa.
+/// Infer RateLimited for non-Codex Waiting sessions from same-agent quota.
+/// Codex runtime waits are preserved; account usage does not prove blocking.
 fn promote_waiting_to_rate_limited(sessions: &mut [AgentSession], rate_limits: &[RateLimitInfo]) {
     if rate_limits.is_empty() {
         return;
     }
     for s in sessions.iter_mut() {
-        if s.status != SessionStatus::Waiting {
+        if s.status != SessionStatus::Waiting || s.agent_cli == "codex" {
             continue;
         }
         let over = rate_limits.iter().any(|rl| {
@@ -1078,6 +1084,32 @@ mod tests {
         promote_waiting_to_rate_limited(&mut sessions, &limits);
         assert_eq!(sessions[0].status, SessionStatus::RateLimited);
         assert_eq!(sessions[1].status, SessionStatus::Waiting);
+    }
+
+    #[test]
+    fn codex_idle_is_not_changed_by_account_quota() {
+        let mut sessions = vec![waiting_session("codex")];
+        promote_waiting_to_rate_limited(&mut sessions, &[rate_limit("codex", 99.0)]);
+        assert_eq!(sessions[0].status, SessionStatus::Waiting);
+    }
+
+    #[test]
+    fn kill_rejects_shared_native_session_before_confirmation_or_commands() {
+        let mut app = App::new_with_config(
+            crate::theme::Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        app.sessions = vec![waiting_session("codex")];
+        app.sessions[0].pid = 0;
+        app.kill_selected();
+        assert!(app.kill_confirm.is_none());
+        assert!(app
+            .status_msg
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("no exclusive process"));
     }
 
     #[test]

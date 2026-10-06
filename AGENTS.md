@@ -35,7 +35,8 @@ src/
 ├── collector/
 │   ├── mod.rs              # AgentCollector trait, shared process data, caches/orphans
 │   ├── claude.rs           # Claude Code: session discovery, transcript parsing
-│   ├── codex.rs            # CLI/app-server discovery and rollout JSONL parsing
+│   ├── codex.rs            # One worker, native/fallback merging, rollout parsing
+│   ├── codex/native.rs     # Read-only local app-server metadata/status protocol
 │   ├── opencode.rs         # Process/cwd matching and read-only SQLite queries
 │   ├── mcp.rs              # codex mcp-server detection and rollout ownership
 │   ├── process.rs          # Platform process/port backends, process trees, Git stats
@@ -176,15 +177,21 @@ Key line types:
 - **Partial line handling**: leave the offset before incomplete invalid JSON and retry those bytes on the next read. Valid JSON without a trailing newline is accepted. Complete malformed lines are skipped; reads cap individual lines at 10 MiB.
 - **File rotation**: if the file shrinks or its identity changes, reset and re-scan.
 
-### 3. Codex CLI and desktop sessions: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
+### 3. Codex sessions: local app-server + rollout JSONL
 
 Discovery strategy:
-1. Find running CLI processes and `codex app-server` hosts from shared process data.
-2. Map CLI PID → open rollout via `lsof` on macOS, `/proc/{pid}/fd` on Linux, or recent-file heuristics on Windows.
-3. Parse `session_meta`, `turn_context`, `event_msg` (including `token_count`), `response_item`, and newer `item_completed` wrappers for metadata, tokens, chat, and tool lifecycle. Codex currently re-parses selected files from the beginning on each collection; it does not use Claude's incremental offset cache.
-4. Discover recent desktop rollouts (30-minute activity threshold) from the filesystem first; background open-file scans refine PID ownership. Background scans also cover older day directories, at most once per minute. Unconfirmed owners are `Unknown` with PID 0. Guardian review rollouts are excluded.
-5. Recognize daemon-backed CLI rollouts using app-server ownership without attaching the shared host's children/memory to each session. Desktop sessions likewise do not inherit the shared host's process tree.
-6. Scan today's unowned rollouts for recently finished sessions (< 5 minutes); `MultiCollector` removes `Done` rows from the displayed result. MCP-owned rollouts are suppressed by default and shown in the MCP panel instead.
+1. One Codex-owned worker queries existing Unix sockets on macOS/Linux under default `~/.codex`, `CODEX_HOME`, and roots inferred from live processes' open rollouts. Canonicalize roots/paths. No daemon startup, thread resume, or subscriptions.
+2. Initialize the local WebSocket-over-Unix connection, paginate `thread/loaded/list`, and request each thread via `thread/read` with `includeTurns: false`. The Unix peer PID identifies the queried instance, never an individual session's kill target. Two-second socket I/O/RPC timeouts; transport failure skips remaining reads on that connection.
+3. Merge by `(canonical config root, thread.id)`. Store thread ID in `AgentSession.session_id`; the API's session-tree `sessionId`, PID, and cwd are not deduplication keys. Loaded subagent/fork threads are independent rows, including threads with no rollout yet or ephemeral history.
+4. Parse selected rollout paths once per tick for tokens, chat, tools, and context using `session_meta`, `turn_context`, `event_msg`, `response_item`, and newer `item_completed` wrappers. Codex still re-parses from the beginning rather than using Claude's incremental offsets. Runtime metadata/status takes precedence; missing metrics use the existing empty defaults.
+5. CLI/open-file fallback preserves exclusive ownership only when one verified CLI process holds one rollout. Multiple owners/files and shared app-server/MCP processes remain Unknown/PID 0; shared children, memory, and ports are never attached to every thread. Successfully queried host FDs cannot recreate unloaded historical rows.
+6. For roots with unavailable native queries and an unqueried app-server host, recursively scan rollout date directories at most once per minute, without following symlinks. Keep files less than 30 minutes old as Unknown candidates, using the existing interactive-originator filter. Windows uses recent-file Unknown candidates without heuristic PID assignment. The age filter never gates a loaded native thread or exclusive live CLI rollout.
+7. Guardian review threads are excluded; MCP-owned rollouts are suppressed by default and shown in the MCP panel. Remove the old recently-finished file scan: Done rows are already filtered from live results.
+8. Failed/incomplete native queries retain prior metadata as Unknown only while the recorded server PID is still an app-server in fresh process data. A complete successful list replaces that instance's snapshot. A missing thread on one instance says nothing about independent CLI/app-server instances.
+
+`--once`/`--json` wait up to ten seconds for initial discovery, then collect again.
+Library users may call `App::wait_for_discovery(timeout)` between their first two
+collection ticks. Interactive polling consumes results without waiting.
 
 Rate limits extracted from `token_count` events:
 ```json
@@ -275,19 +282,23 @@ Claude's `stats-cache.json` and `history.jsonl` are not live-monitor inputs; do 
 ◉ Thinking    = model generation inferred from transcript/events
 ● Executing   = pending tool, active descendant, or working Claude subagent
 ◌ Waiting     = completed turn, user/permission wait, or no active signal
-? Unknown     = recent Codex rollout without confirmed process ownership
-⏳ RateLimited = Waiting + same-agent quota usage > 90% in either window
+? Unknown     = unconfirmed ownership or unavailable Codex runtime status
+✗ Error       = Codex reports systemError
+⏳ RateLimited = non-Codex Waiting + same-agent quota usage > 90%
 ✓ Done        = collector reports finished/dead session; filtered from live results
 ```
 
 Claude uses pending tool calls, active descendants (> 5% CPU), working subagents,
 and real user prompts awaiting a reply. It does not gate Thinking on transcript
 mtime: a long streamed response may not update the file until it completes.
-Codex uses task/turn completion, user-input requests, pending tool lifecycle, and
-generation events; completed interactive turns are Waiting, whereas completed
-`codex exec` sessions are Done. OpenCode uses DB updates within 30 seconds or
+Codex prefers native status: idle and approval/user-input flags map to Waiting,
+systemError to Error, and active turns to Executing when a recorded tool is
+pending, otherwise Thinking. Native waiting/error/unknown states clear stale
+execution timers. Without native status, exclusive CLI ownership uses the
+existing turn/tool/generation inference; completed interactive turns are Waiting,
+whereas completed `codex exec` sessions are Done. OpenCode uses DB updates within 30 seconds or
 CPU activity (agent > 1%, descendants > 5%) to infer Thinking, otherwise Waiting.
-There is no `Working` or `Error` variant in the current `SessionStatus` enum.
+There is no `Working` variant; `Error` is available for native Codex system errors.
 
 Dead Claude/OpenCode sessions are omitted by their collectors. Codex may emit
 Done internally, but `MultiCollector` removes Done from the final session list;
@@ -302,12 +313,13 @@ Current task (2nd line under each session):
 - Waiting → "waiting for input"
 - Unknown → "unknown"
 
-**Known limitations** (all heuristic):
+**Known limitations**:
 
-- Thinking/Executing are inferred from recorded events and CPU activity, not authoritative provider status.
-- Waiting can include a permission prompt; RateLimited is inferred from quota saturation rather than an explicit provider wait event.
-- Shared app-server ownership does not prove a specific desktop session is running a tool; Unknown avoids presenting an unowned rollout as confirmed live work.
-- Status is best-effort, not authoritative
+- Native Codex loaded/idle/active/error/wait flags describe the connected instance; Thinking versus Executing still depends on recorded tool events.
+- Independent or older app-server instances without reachable sockets need heuristic fallback; coverage is not guaranteed. Recently finished files may still appear as Unknown candidates.
+- Non-Codex RateLimited is inferred from quota saturation rather than an explicit provider wait event.
+- Shared app-server open files alone do not prove a particular thread is loaded or running.
+- Polling reflects the most recent observation and can be briefly stale.
 
 ## Session Summary Generation
 
@@ -369,13 +381,13 @@ Tracks child processes that have open ports. When a parent session dies but the 
 - **serde** + **serde_json** for JSON/JSONL parsing
 - **chrono** for timestamp formatting
 - **dirs** for platform home/config/cache directories; **unicode-width** for display widths; **tempfile** for the updater download.
-- Platform dependencies: **proc_pidinfo** on Apple targets, **libc** on Linux, **sysinfo** on Windows. SQLite access uses the external `sqlite3` CLI.
+- Platform dependencies: **proc_pidinfo** on Apple targets, **libc** and **tungstenite 0.28** on Unix, **sysinfo** on Windows. SQLite access uses the external `sqlite3` CLI.
 - **Scheduling** (polling, not a filesystem watcher):
   - Input polling/rendering: 500ms idle interval; input can trigger earlier redraws.
   - Session collection + process tree + host sampling: target 2s; ticks are deferred while handling input. Claude tails incrementally, Codex re-parses, OpenCode reuses DB cache.
   - Ports + Git + OpenCode DB: every 5 ticks (~10s); port PID-set changes and new Git cwd entries trigger earlier work.
   - Quota: first tick, then every 6 ticks (~12s) with the current counter; if no data is available, retry every tick.
-  - Desktop rollout background scanners: at most once per minute; open-file scanner has a 90s timeout.
+  - Codex: one background discovery task at a time; native queries each collection cycle, FDs on slow ticks/PID changes (2s macOS timeout), recent compatibility files at most once a minute. Native RPC I/O timeout is 2s.
 
 ## Library / JSON Snapshot
 

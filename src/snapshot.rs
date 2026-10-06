@@ -334,6 +334,7 @@ mod tests {
             (SessionStatus::Executing, "\"Executing\""),
             (SessionStatus::Waiting, "\"Waiting\""),
             (SessionStatus::Unknown, "\"Unknown\""),
+            (SessionStatus::Error, "\"Error\""),
             (SessionStatus::RateLimited, "\"RateLimited\""),
             (SessionStatus::Done, "\"Done\""),
         ] {

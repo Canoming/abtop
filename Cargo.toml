@@ -29,8 +29,9 @@ proc_pidinfo = "0.1"
 [target.'cfg(target_os = "windows")'.dependencies]
 sysinfo = "0.32"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 
 # The profile that 'dist' will build with
 [profile.dist]
